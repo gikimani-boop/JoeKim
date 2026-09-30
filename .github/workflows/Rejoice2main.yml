@@ -1,0 +1,640 @@
+```yaml
+name: RDP
+
+on:
+  workflow_dispatch:
+
+# IMPORTANT:
+# GitHub-hosted Windows runners have a platform-enforced job limit.
+# timeout-minutes cannot extend a GitHub-hosted job beyond GitHub's limit.
+#
+# For genuine long-term / 24x7 operation, use a persistent Windows VPS
+# and register it as a self-hosted runner.
+#
+# This workflow nevertheless:
+#   1. Enables RDP correctly.
+#   2. Keeps RDP available after disconnecting the RDP session.
+#   3. Keeps Windows from entering sleep states.
+#   4. Installs Tailscale.
+#   5. Runs Tailscale in unattended mode.
+#   6. Assigns RDP as the Tailscale operator.
+#   7. Allows the RDP account to run:
+#          tailscale ip
+#          tailscale status
+#          tailscale ping
+#          tailscale set
+#      without the "Tailscale already in use by runneradmin" problem.
+#   8. Restricts RDP firewall access to the Tailscale CGNAT range.
+#   9. Creates the RDP account with administrator privileges.
+#  10. Keeps the workflow alive while GitHub keeps the hosted runner alive.
+
+jobs:
+
+  secure-rdp:
+
+    runs-on: windows-latest
+
+    # This value is NOT capable of overriding GitHub's
+    # platform-level hosted-runner execution limit.
+    #
+    # GitHub-hosted runners currently have a maximum
+    # job execution time of 6 hours.
+    timeout-minutes: 360
+
+    steps:
+
+      # ============================================================
+      # 1. CONFIGURE WINDOWS POWER / RDP
+      # ============================================================
+      - name: Configure Windows Power and RDP
+        shell: powershell
+        run: |
+
+          Write-Host "=== CONFIGURING WINDOWS POWER SETTINGS ==="
+
+          # Prevent AC power sleep / hibernation.
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+          # Prevent display timeout while connected to AC power.
+          powercfg /change monitor-timeout-ac 0
+
+          # Also configure DC settings where applicable.
+          powercfg /change standby-timeout-dc 0
+          powercfg /change hibernate-timeout-dc 0
+          powercfg /change monitor-timeout-dc 0
+
+          # Disable hibernation.
+          powercfg /hibernate off
+
+          Write-Host "Power settings configured."
+
+          # ========================================================
+          # RDP
+          # ========================================================
+
+          Write-Host "=== CONFIGURING RDP ==="
+
+          # Enable Remote Desktop.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
+
+          # KEEP NLA ENABLED.
+          #
+          # The previous workflow disabled NLA.
+          # There is normally no need to weaken RDP security just
+          # to use Tailscale.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1 `
+            -Force
+
+          # Use the normal RDP security layer.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 1 `
+            -Force
+
+          # ========================================================
+          # FIREWALL
+          # ========================================================
+
+          Write-Host "Configuring RDP firewall."
+
+          # Remove old rules created by previous versions.
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+
+          # Tailscale IPv4 addresses use the 100.64.0.0/10 range.
+          #
+          # Therefore do NOT expose TCP/3389 to the entire Internet.
+          #
+          # Allow RDP only from Tailscale IPv4 addresses.
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389 `
+            remoteip=100.64.0.0/10 `
+            profile=any
+
+          # Restart Remote Desktop service.
+          Restart-Service -Name TermService -Force
+
+          Write-Host "RDP configuration complete."
+
+
+      # ============================================================
+      # 2. CREATE RDP USER
+      # ============================================================
+      - name: Create RDP User
+        shell: powershell
+        run: |
+
+          Write-Host "=== CREATING RDP USER ==="
+
+          # If the account already exists, do not recreate it.
+          $existingUser = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+
+          if (-not $existingUser) {
+
+              Add-Type -AssemblyName System.Security
+
+              $charSet = @{
+                  Upper   = [char[]](65..90)
+                  Lower   = [char[]](97..122)
+                  Number  = [char[]](48..57)
+                  Special = (
+                      [char[]](33..47) +
+                      [char[]](58..64) +
+                      [char[]](91..96) +
+                      [char[]](123..126)
+                  )
+              }
+
+              $rawPassword = @()
+
+              $rawPassword += $charSet.Upper   | Get-Random -Count 4
+              $rawPassword += $charSet.Lower   | Get-Random -Count 4
+              $rawPassword += $charSet.Number  | Get-Random -Count 4
+              $rawPassword += $charSet.Special | Get-Random -Count 4
+
+              $password = -join (
+                  $rawPassword | Sort-Object { Get-Random }
+              )
+
+              $securePass = ConvertTo-SecureString `
+                  $password `
+                  -AsPlainText `
+                  -Force
+
+              New-LocalUser `
+                  -Name "RDP" `
+                  -Password $securePass `
+                  -AccountNeverExpires `
+                  -PasswordNeverExpires:$true `
+                  -Description "RDP access account"
+
+              # Add RDP user to Administrators.
+              Add-LocalGroupMember `
+                  -Group "Administrators" `
+                  -Member "RDP"
+
+              # Also explicitly add to Remote Desktop Users.
+              Add-LocalGroupMember `
+                  -Group "Remote Desktop Users" `
+                  -Member "RDP"
+
+              # Store credentials in the GitHub job environment.
+              "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
+              "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+              Write-Host "RDP account created."
+
+          }
+          else {
+
+              Write-Host "RDP account already exists."
+
+              # Make sure it remains enabled.
+              Enable-LocalUser -Name "RDP"
+
+              # Ensure required group memberships.
+              try {
+                  Add-LocalGroupMember `
+                    -Group "Administrators" `
+                    -Member "RDP" `
+                    -ErrorAction Stop
+              }
+              catch {
+                  Write-Host "RDP already belongs to Administrators."
+              }
+
+              try {
+                  Add-LocalGroupMember `
+                    -Group "Remote Desktop Users" `
+                    -Member "RDP" `
+                    -ErrorAction Stop
+              }
+              catch {
+                  Write-Host "RDP already belongs to Remote Desktop Users."
+              }
+          }
+
+
+      # ============================================================
+      # 3. INSTALL TAILSCALE
+      # ============================================================
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+
+          Write-Host "=== INSTALLING TAILSCALE ==="
+
+          $tsVersion = "1.82.0"
+
+          $tsUrl = `
+            "https://pkgs.tailscale.com/stable/tailscale-setup-$tsVersion-amd64.msi"
+
+          $installerPath = `
+            Join-Path $env:TEMP "tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installerPath
+
+          Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList @(
+                "/i",
+                "`"$installerPath`"",
+                "/quiet",
+                "/norestart"
+            ) `
+            -Wait
+
+          Remove-Item `
+            $installerPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Tailscale installation complete."
+
+          # Verify installation.
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" version
+
+
+      # ============================================================
+      # 4. CONFIGURE TAILSCALE OPERATOR
+      # ============================================================
+      - name: Configure Tailscale for RDP User
+        shell: powershell
+        run: |
+
+          Write-Host "=== CONFIGURING TAILSCALE OPERATOR ==="
+
+          $tailscale = `
+            "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+              Write-Error "Tailscale executable not found."
+              exit 1
+          }
+
+          # --------------------------------------------------------
+          # IMPORTANT FIX
+          #
+          # Previously Tailscale was controlled exclusively by:
+          #
+          #     runneradmin
+          #
+          # Therefore the RDP account received:
+          #
+          #     401 Unauthorized:
+          #     Tailscale already in use by runneradmin
+          #
+          # Assign the RDP account as the Tailscale operator.
+          # --------------------------------------------------------
+
+          & $tailscale set --operator="RDP"
+
+          Write-Host "Tailscale operator set to RDP."
+
+          # Make sure the Windows service starts automatically.
+          Set-Service `
+            -Name "Tailscale" `
+            -StartupType Automatic
+
+          # Restart the service so the configuration is applied.
+          Restart-Service `
+            -Name "Tailscale" `
+            -Force
+
+          Start-Sleep -Seconds 5
+
+          Get-Service Tailscale | Format-List Name,Status,StartType
+
+
+      # ============================================================
+      # 5. CONNECT TAILSCALE
+      # ============================================================
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+
+          Write-Host "=== CONNECTING TO TAILSCALE ==="
+
+          $tailscale = `
+            "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+              Write-Error "TAILSCALE_AUTH_KEY secret is missing."
+              exit 1
+          }
+
+          # --------------------------------------------------------
+          # Connect Tailscale.
+          #
+          # --unattended is important on Windows because it tells
+          # Tailscale to remain running even when the interactive
+          # user logs out.
+          # --------------------------------------------------------
+
+          & $tailscale up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="gh-rdp-$env:GITHUB_RUN_ID" `
+            --unattended
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Tailscale connection failed."
+              exit 1
+          }
+
+          Write-Host "Tailscale connection established."
+
+
+      # ============================================================
+      # 6. WAIT FOR TAILSCALE IP
+      # ============================================================
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+
+          Write-Host "=== WAITING FOR TAILSCALE IPv4 ==="
+
+          $tailscale = `
+            "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          $tsIP = $null
+
+          for ($i = 1; $i -le 30; $i++) {
+
+              try {
+
+                  $candidate = `
+                    & $tailscale ip -4 2>$null
+
+                  if ($candidate) {
+
+                      $candidate = `
+                        ($candidate | Select-Object -First 1).Trim()
+
+                      if ($candidate -match '^100\.\d+\.\d+\.\d+$') {
+
+                          $tsIP = $candidate
+                          break
+                      }
+                  }
+
+              }
+              catch {
+                  # Continue retrying.
+              }
+
+              Write-Host "Waiting for Tailscale IP... attempt $i/30"
+
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IPv4 address was not assigned."
+              exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "TAILSCALE IPv4: $tsIP"
+          Write-Host "=========================================="
+
+
+      # ============================================================
+      # 7. VERIFY TAILSCALE FROM THE RDP ACCOUNT
+      # ============================================================
+      - name: Verify Tailscale Operator Access
+        shell: powershell
+        run: |
+
+          Write-Host "=== VERIFYING RDP USER TAILSCALE ACCESS ==="
+
+          $tailscale = `
+            "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          # Test using the RDP account's security context.
+          #
+          # This verifies that the RDP account is now permitted
+          # to communicate with the Tailscale daemon.
+
+          $result = & runas.exe `
+            /user:"$env:COMPUTERNAME\RDP" `
+            /savecred `
+            "`"$tailscale`" ip -4"
+
+          Write-Host $result
+
+          Write-Host ""
+          Write-Host "The RDP account has been configured as the"
+          Write-Host "Tailscale operator."
+
+
+      # ============================================================
+      # 8. VERIFY RDP PORT
+      # ============================================================
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+
+          Write-Host "=== VERIFYING RDP PORT ==="
+
+          $tsIP = $env:TAILSCALE_IP
+
+          if (-not $tsIP) {
+              Write-Error "TAILSCALE_IP is not available."
+              exit 1
+          }
+
+          $testResult = `
+            Test-NetConnection `
+              -ComputerName $tsIP `
+              -Port 3389
+
+          $testResult | Format-List
+
+          if (-not $testResult.TcpTestSucceeded) {
+
+              Write-Error `
+                "TCP/3389 is not accessible."
+
+              exit 1
+          }
+
+          Write-Host "RDP TCP connectivity successful."
+
+
+      # ============================================================
+      # 9. CREATE TAILSCALE / RDP HEALTH MONITOR
+      # ============================================================
+      - name: Create RDP Health Monitor
+        shell: powershell
+        run: |
+
+          Write-Host "=== CREATING HEALTH MONITOR ==="
+
+          $monitorPath = "C:\RDP-Tailscale-Monitor.ps1"
+
+          @'
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          while ($true) {
+
+              $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+              # ----------------------------------------------------
+              # Check Tailscale service.
+              # ----------------------------------------------------
+              $service = Get-Service `
+                -Name "Tailscale" `
+                -ErrorAction SilentlyContinue
+
+              if ($service -and $service.Status -ne "Running") {
+
+                  Write-Host "[$time] Tailscale service is not running."
+
+                  try {
+                      Start-Service `
+                        -Name "Tailscale" `
+                        -ErrorAction Stop
+                  }
+                  catch {
+                      Write-Host "[$time] Failed to start Tailscale service."
+                  }
+              }
+
+              # ----------------------------------------------------
+              # Check Tailscale IP.
+              # ----------------------------------------------------
+              try {
+
+                  $ip = & $tailscale ip -4 2>$null
+
+                  if ($ip) {
+                      Write-Host "[$time] Tailscale IPv4: $ip"
+                  }
+                  else {
+                      Write-Host "[$time] Tailscale IPv4 unavailable."
+                  }
+
+              }
+              catch {
+
+                  Write-Host "[$time] Tailscale CLI check failed."
+              }
+
+              Start-Sleep -Seconds 60
+          }
+          '@ | Set-Content `
+            -Path $monitorPath `
+            -Encoding UTF8
+
+          Write-Host "Health monitor created at:"
+          Write-Host $monitorPath
+
+
+      # ============================================================
+      # 10. DISPLAY CONNECTION INFORMATION
+      # ============================================================
+      - name: Display RDP Access Information
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "============================================================"
+          Write-Host "                 RDP ACCESS INFORMATION"
+          Write-Host "============================================================"
+          Write-Host ""
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Username     : RDP"
+          Write-Host ""
+          Write-Host "Connect using:"
+          Write-Host ""
+          Write-Host "mstsc /v:$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "============================================================"
+          Write-Host ""
+          Write-Host "IMPORTANT:"
+          Write-Host ""
+          Write-Host "The RDP user is configured as the Tailscale operator."
+          Write-Host "Therefore, from the RDP account you should be able to run:"
+          Write-Host ""
+          Write-Host "    tailscale ip -4"
+          Write-Host "    tailscale status"
+          Write-Host "    tailscale ping <device>"
+          Write-Host ""
+          Write-Host "without the previous:"
+          Write-Host ""
+          Write-Host "    401 Unauthorized"
+          Write-Host "    Tailscale already in use by runneradmin"
+          Write-Host ""
+          Write-Host "============================================================"
+
+
+      # ============================================================
+      # 11. KEEP JOB ALIVE
+      # ============================================================
+      - name: Maintain RDP Session
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "============================================================"
+          Write-Host "             RDP SESSION IS ACTIVE"
+          Write-Host "============================================================"
+          Write-Host ""
+
+          while ($true) {
+
+              $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+              # ----------------------------------------------------
+              # Check RDP service.
+              # ----------------------------------------------------
+              $rdpService = `
+                Get-Service `
+                  -Name "TermService" `
+                  -ErrorAction SilentlyContinue
+
+              # ----------------------------------------------------
+              # Check Tailscale service.
+              # ----------------------------------------------------
+              $tsService = `
+                Get-Service `
+                  -Name "Tailscale" `
+                  -ErrorAction SilentlyContinue
+
+              # ----------------------------------------------------
+              # Check Tailscale IP.
+              # ----------------------------------------------------
+              $tailscale = `
+                "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+              $tsIP = `
+                & $tailscale ip -4 2>$null
+
+              Write-Host ""
+              Write-Host "[$now]"
+              Write-Host "RDP Service      : $($rdpService.Status)"
+              Write-Host "Tailscale Service: $($tsService.Status)"
+              Write-Host "Tailscale IPv4   : $tsIP"
+              Write-Host ""
+
+              Start-Sleep -Seconds 300
+          }
+```
